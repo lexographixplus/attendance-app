@@ -1,0 +1,5 @@
+{
+  "name": "TrainTrack - Training Registration System",
+  "description": "A comprehensive training management system for admins and super admins to manage schedules, trainees, and attendance via QR codes.",
+  "requestFramePermissions": []
+}
