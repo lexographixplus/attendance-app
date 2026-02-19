@@ -15,6 +15,7 @@ export interface User {
   role: UserRole;
   workspaceId: string;
   parentAdminId?: string | null;
+  apiToken?: string;
 }
 
 export interface Training {

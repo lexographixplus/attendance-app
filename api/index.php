@@ -2,10 +2,18 @@
 
 ini_set('display_errors', '1');
 error_reporting(E_ALL);
+ini_set('log_errors', '1');
+ini_set('error_log', __DIR__ . '/error.log');
+
+function trace(string $msg): void {
+    file_put_contents(__DIR__ . '/error.log', date('[Y-m-d H:i:s] ') . $msg . "\n", FILE_APPEND);
+}
+
+trace("Request received: " . ($_GET['action'] ?? 'no action'));
 
 header('Content-Type: application/json; charset=utf-8');
 header('Access-Control-Allow-Origin: *');
-header('Access-Control-Allow-Headers: Content-Type, Accept');
+header('Access-Control-Allow-Headers: Content-Type, Accept, Authorization'); // Added Authorization
 header('Access-Control-Allow-Methods: GET, POST, OPTIONS');
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -13,7 +21,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
     exit;
 }
 
-require_once __DIR__ . '/config.php';
+try {
+    require_once __DIR__ . '/config.php';
+} catch (Throwable $e) {
+    http_response_code(500);
+    echo json_encode(['error' => 'Config load failed: ' . $e->getMessage()]);
+    exit;
+}
 
 function respond($data = null, int $status = 200): void {
     http_response_code($status);
@@ -52,6 +66,38 @@ function request_data(): array {
     return is_array($decoded) ? $decoded : [];
 }
 
+function get_bearer_token(): ?string {
+    $headers = null;
+    if (isset($_SERVER['Authorization'])) {
+        $headers = trim($_SERVER["Authorization"]);
+    } else if (isset($_SERVER['HTTP_AUTHORIZATION'])) {
+        $headers = trim($_SERVER["HTTP_AUTHORIZATION"]);
+    } elseif (function_exists('apache_request_headers')) {
+        $requestHeaders = apache_request_headers();
+        $requestHeaders = array_combine(array_map('ucwords', array_keys($requestHeaders)), array_values($requestHeaders));
+        if (isset($requestHeaders['Authorization'])) {
+            $headers = trim($requestHeaders['Authorization']);
+        }
+    }
+    if (!empty($headers)) {
+        if (preg_match('/Bearer\s(\S+)/', $headers, $matches)) {
+            return $matches[1];
+        }
+    }
+    return null;
+}
+
+function authenticate(PDO $pdo): array {
+    $token = get_bearer_token();
+    if (!$token) fail('Unauthorized: Missing token.', 401);
+
+    $stmt = $pdo->prepare("SELECT * FROM users WHERE api_token = ?");
+    $stmt->execute([$token]);
+    $user = $stmt->fetch();
+    if (!$user) fail('Unauthorized: Invalid token.', 401);
+    return $user;
+}
+
 function pdo(): PDO {
     static $pdo = null;
     if ($pdo instanceof PDO) {
@@ -77,11 +123,26 @@ function ensure_schema(PDO $pdo): void {
             role ENUM('super_admin', 'admin', 'sub_admin') NOT NULL,
             workspace_id VARCHAR(64) NOT NULL,
             parent_admin_id VARCHAR(64) NULL,
+            api_token VARCHAR(64) NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             INDEX idx_users_workspace (workspace_id),
-            INDEX idx_users_role (role)
+            INDEX idx_users_role (role),
+            INDEX idx_users_token (api_token)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
     ");
+    
+    // Auto-migration: Check for api_token column in users table
+    try {
+        $pdo->query("SELECT api_token FROM users LIMIT 1");
+    } catch (Exception $e) {
+        // Only alter if table exists but column missing
+        try {
+            $pdo->exec("ALTER TABLE users ADD COLUMN api_token VARCHAR(64) NULL AFTER parent_admin_id");
+            $pdo->exec("CREATE INDEX idx_users_token ON users(api_token)");
+        } catch (Exception $ex) {
+             // Ignore error if column exists or table issues (failsafe)
+        }
+    }
 
     $pdo->exec("
         CREATE TABLE IF NOT EXISTS trainings (
@@ -207,11 +268,15 @@ function fetch_user(PDO $pdo, string $id): ?array {
 }
 
 try {
+    trace("Connecting to PDO...");
     $pdo = pdo();
     $action = $_GET['action'] ?? '';
+    trace("Action: $action");
 
     if ($action === 'init') {
+        trace("Ensuring schema...");
         ensure_schema($pdo);
+        trace("Enforcing super admin...");
         enforce_single_super_admin($pdo);
         respond(['ok' => true]);
     }
@@ -241,15 +306,18 @@ try {
         $userId = gen_id('u');
         $workspaceId = gen_id('ws');
         $hash = password_hash($password, PASSWORD_BCRYPT);
+        $token = bin2hex(random_bytes(32));
 
         $stmt = $pdo->prepare("
-            INSERT INTO users (id, name, email, password_hash, role, workspace_id, parent_admin_id)
-            VALUES (?, ?, ?, ?, ?, ?, NULL)
+            INSERT INTO users (id, name, email, password_hash, role, workspace_id, parent_admin_id, api_token)
+            VALUES (?, ?, ?, ?, ?, ?, NULL, ?)
         ");
-        $stmt->execute([$userId, $name, $email, $hash, $role, $workspaceId]);
+        $stmt->execute([$userId, $name, $email, $hash, $role, $workspaceId, $token]);
 
         $created = fetch_user($pdo, $userId);
-        respond(map_user($created));
+        $mapped = map_user($created);
+        $mapped['apiToken'] = $token;
+        respond($mapped);
     }
 
     if ($action === 'login') {
@@ -265,48 +333,75 @@ try {
             fail('Invalid email or password.', 401);
         }
 
-        respond(map_user($user));
+        $token = bin2hex(random_bytes(32));
+        $stmt = $pdo->prepare("UPDATE users SET api_token = ? WHERE id = ?");
+        $stmt->execute([$token, $user['id']]);
+
+        $mapped = map_user($user);
+        $mapped['apiToken'] = $token;
+        respond($mapped);
     }
 
     if ($action === 'user_get') {
+        $user = authenticate($pdo);
         $id = trim((string)($_GET['id'] ?? ''));
         if ($id === '') fail('id is required.');
-        $user = fetch_user($pdo, $id);
-        if ($user) respond(map_user($user));
-        else fail('User not found.', 404);
+        
+        // Users can see themselves. Admins can see users in their workspace?
+        // For simplicity: if you are authenticated, you can fetch user by ID if you have rights.
+        // Actually, user_get is mostly used for "me" check.
+        
+        $target = fetch_user($pdo, $id);
+        if (!$target) fail('User not found.', 404);
+
+        // Access check
+        if ($user['role'] === 'super_admin') {
+            // OK
+        } elseif ($user['id'] === $target['id']) {
+            // OK (Self)
+        } elseif ($user['workspace_id'] === $target['workspace_id']) {
+            // Same workspace members can see each other?
+            // Yes, admins need to see sub_admins.
+        } else {
+             fail('Access denied.', 403);
+        }
+
+        respond(map_user($target));
     }
 
     if ($action === 'users') {
+        $user = authenticate($pdo);
         $workspaceId = trim((string)($_GET['workspaceId'] ?? ''));
-        $actorId = trim((string)($_GET['actorId'] ?? ''));
-
-        if ($workspaceId !== '') {
-            $stmt = $pdo->prepare("SELECT * FROM users WHERE workspace_id = ? ORDER BY created_at ASC");
-            $stmt->execute([$workspaceId]);
-            $rows = $stmt->fetchAll();
-        } elseif ($actorId !== '') {
-            $actor = fetch_user($pdo, $actorId);
-            if ($actor && $actor['role'] === 'super_admin') {
-                $rows = $pdo->query("SELECT * FROM users ORDER BY created_at ASC")->fetchAll();
-            } else {
-                fail('Access denied.', 403);
-            }
+        
+        if ($user['role'] === 'super_admin') {
+             // Super admin can see all users or filter by workspace
+             if ($workspaceId !== '') {
+                 $stmt = $pdo->prepare("SELECT * FROM users WHERE workspace_id = ? ORDER BY created_at ASC");
+                 $stmt->execute([$workspaceId]);
+                 $rows = $stmt->fetchAll();
+             } else {
+                 $rows = $pdo->query("SELECT * FROM users ORDER BY created_at ASC")->fetchAll();
+             }
         } else {
-            fail('workspaceId or valid super admin actorId is required.', 403);
+             // Regular admins can only see their own workspace users
+             if ($workspaceId !== '' && $workspaceId !== $user['workspace_id']) {
+                 fail('Access denied: Workspace mismatch.', 403);
+             }
+             $stmt = $pdo->prepare("SELECT * FROM users WHERE workspace_id = ? ORDER BY created_at ASC");
+             $stmt->execute([$user['workspace_id']]);
+             $rows = $stmt->fetchAll();
         }
 
         respond(array_map('map_user', $rows));
     }
 
     if ($action === 'users_create') {
+        $actor = authenticate($pdo);
         $input = request_data();
-        $actorId = (string)($input['actorId'] ?? '');
         $name = trim((string)($input['name'] ?? ''));
         $email = normalize_email((string)($input['email'] ?? ''));
         $password = (string)($input['password'] ?? '');
 
-        $actor = fetch_user($pdo, $actorId);
-        if (!$actor) fail('Invalid actor.', 403);
         if (!in_array($actor['role'], ['super_admin', 'admin'], true)) fail('Not allowed.', 403);
 
         if ($name === '' || $email === '' || trim($password) === '') {
@@ -322,44 +417,51 @@ try {
         $role = $actor['role'] === 'super_admin' ? 'admin' : 'sub_admin';
         $id = gen_id('u');
         $hash = password_hash($password, PASSWORD_BCRYPT);
+        $token = bin2hex(random_bytes(32));
 
         $stmt = $pdo->prepare("
-            INSERT INTO users (id, name, email, password_hash, role, workspace_id, parent_admin_id)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO users (id, name, email, password_hash, role, workspace_id, parent_admin_id, api_token)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         ");
-        $stmt->execute([$id, $name, $email, $hash, $role, $actor['workspace_id'], $actor['id']]);
+        $stmt->execute([$id, $name, $email, $hash, $role, $actor['workspace_id'], $actor['id'], $token]);
 
         $created = fetch_user($pdo, $id);
         respond(map_user($created));
     }
 
     if ($action === 'users_delete') {
+        $actor = authenticate($pdo);
         $input = request_data();
-        $actorId = (string)($input['actorId'] ?? '');
         $workspaceId = (string)($input['workspaceId'] ?? '');
         $id = (string)($input['id'] ?? '');
 
-        $actor = fetch_user($pdo, $actorId);
         $target = fetch_user($pdo, $id);
-        if (!$actor || !$target) fail('User not found.', 404);
+        if (!$target) fail('User not found.', 404);
 
         if ($target['role'] === 'super_admin') {
             fail('The super admin account cannot be deleted.', 403);
         }
-        if ($workspaceId !== '' && $target['workspace_id'] !== $workspaceId) {
-            fail('Workspace mismatch.', 403);
-        }
-
-        $canDelete = false;
+        
+        // Super admin can delete anyone (except self/other super admins check above)
         if ($actor['role'] === 'super_admin') {
-            $canDelete = true;
+            // workspace check not strictly needed for super admin if they want to manage globally, 
+            // but if passed, check it.
+             if ($workspaceId !== '' && $target['workspace_id'] !== $workspaceId) {
+                fail('Workspace mismatch.', 403);
+             }
         } elseif ($actor['role'] === 'admin') {
-            $canDelete = $target['workspace_id'] === $actor['workspace_id']
-                && $target['parent_admin_id'] === $actor['id']
-                && $target['role'] === 'sub_admin';
+             // Admin can only delete users in their workspace
+             if ($target['workspace_id'] !== $actor['workspace_id']) {
+                 fail('Access denied: Workspace mismatch.', 403);
+             }
+             // Admin can only delete sub_admins they created (or all sub_admins in their workspace?)
+             // Original logic: $target['parent_admin_id'] === $actor['id']
+             if ($target['role'] !== 'sub_admin') {
+                 fail('Admins can only delete sub-admins.', 403);
+             }
+        } else {
+            fail('Not allowed.', 403);
         }
-
-        if (!$canDelete) fail('Not allowed.', 403);
 
         $stmt = $pdo->prepare("DELETE FROM users WHERE id = ?");
         $stmt->execute([$id]);
@@ -367,8 +469,8 @@ try {
     }
 
     if ($action === 'users_promote') {
+        $actor = authenticate($pdo);
         $input = request_data();
-        $actorId = (string)($input['actorId'] ?? '');
         $workspaceId = (string)($input['workspaceId'] ?? '');
         $id = (string)($input['id'] ?? '');
         $newRole = (string)($input['newRole'] ?? '');
@@ -380,9 +482,8 @@ try {
             fail('Invalid role.');
         }
 
-        $actor = fetch_user($pdo, $actorId);
         $target = fetch_user($pdo, $id);
-        if (!$actor || !$target) fail('User not found.', 404);
+        if (!$target) fail('User not found.', 404);
         if ($actor['role'] !== 'super_admin') fail('Only super admin can promote.', 403);
         if ($target['role'] === 'super_admin') fail('Super admin role cannot be changed.', 403);
         if ($workspaceId !== '' && $target['workspace_id'] !== $workspaceId) fail('Workspace mismatch.', 403);
@@ -393,9 +494,14 @@ try {
     }
 
     if ($action === 'trainings') {
+        $user = authenticate($pdo);
         $workspaceId = trim((string)($_GET['workspaceId'] ?? ''));
         $adminId = trim((string)($_GET['adminId'] ?? ''));
+        
         if ($workspaceId === '') fail('workspaceId is required.');
+        if ($user['role'] !== 'super_admin' && $user['workspace_id'] !== $workspaceId) {
+             fail('Access denied.', 403);
+        }
 
         if ($adminId !== '') {
             $stmt = $pdo->prepare("SELECT * FROM trainings WHERE workspace_id = ? AND admin_id = ? ORDER BY created_at DESC");
@@ -410,8 +516,14 @@ try {
     }
 
     if ($action === 'trainings_create') {
+        $user = authenticate($pdo);
         $input = request_data();
         $workspaceId = (string)($input['workspaceId'] ?? '');
+        
+        if ($user['role'] !== 'super_admin' && $user['workspace_id'] !== $workspaceId) {
+             fail('Access denied.', 403);
+        }
+
         $training = $input['training'] ?? null;
         if ($workspaceId === '' || !is_array($training)) fail('Invalid payload.');
 
@@ -425,7 +537,14 @@ try {
         $location = trim((string)($training['location'] ?? ''));
         $description = trim((string)($training['description'] ?? ''));
         $resourcesLink = trim((string)($training['resourcesLink'] ?? ''));
-        $adminId = (string)($training['adminId'] ?? '');
+        
+        // Admin ID must be the creator, unless super admin assigns someone else?
+        // For simplicity, force adminId to be the creator if not super admin.
+        $assignedAdminId = (string)($training['adminId'] ?? '');
+        if ($user['role'] !== 'super_admin' || $assignedAdminId === '') {
+             $assignedAdminId = $user['id'];
+        }
+
         $startDate = (string)($training['startDate'] ?? $dates[0]);
         $endDate = (string)($training['endDate'] ?? $dates[count($dates) - 1]);
 
@@ -436,7 +555,7 @@ try {
         $stmt->execute([
             $id,
             $workspaceId,
-            $adminId,
+            $assignedAdminId,
             $title,
             $type,
             $location,
@@ -453,9 +572,15 @@ try {
     }
 
     if ($action === 'trainings_update') {
+        $user = authenticate($pdo);
         $input = request_data();
         $workspaceId = (string)($input['workspaceId'] ?? '');
         $id = (string)($input['id'] ?? '');
+        
+        if ($user['role'] !== 'super_admin' && $user['workspace_id'] !== $workspaceId) {
+             fail('Access denied.', 403);
+        }
+
         $data = $input['data'] ?? null;
         if ($workspaceId === '' || $id === '' || !is_array($data)) fail('Invalid payload.');
 
@@ -463,6 +588,10 @@ try {
         $stmt->execute([$workspaceId, $id]);
         $current = $stmt->fetch();
         if (!$current) fail('Training not found.', 404);
+        
+        if ($user['role'] !== 'super_admin' && $current['admin_id'] !== $user['id']) {
+            fail('You can only update your own trainings.', 403);
+        }
 
         $currentMapped = map_training($current);
         $merged = array_merge($currentMapped, $data);
@@ -493,10 +622,23 @@ try {
     }
 
     if ($action === 'trainings_delete') {
+        $user = authenticate($pdo);
         $input = request_data();
         $workspaceId = (string)($input['workspaceId'] ?? '');
         $id = (string)($input['id'] ?? '');
-        if ($workspaceId === '' || $id === '') fail('Invalid payload.');
+
+        if ($user['role'] !== 'super_admin' && $user['workspace_id'] !== $workspaceId) {
+             fail('Access denied.', 403);
+        }
+        
+        $stmt = $pdo->prepare("SELECT * FROM trainings WHERE workspace_id = ? AND id = ?");
+        $stmt->execute([$workspaceId, $id]);
+        $current = $stmt->fetch();
+        if (!$current) fail('Training not found.', 404);
+
+        if ($user['role'] !== 'super_admin' && $current['admin_id'] !== $user['id']) {
+            fail('You can only delete your own trainings.', 403);
+        }
 
         $stmt = $pdo->prepare("DELETE FROM attendance WHERE workspace_id = ? AND training_id = ?");
         $stmt->execute([$workspaceId, $id]);
@@ -520,8 +662,14 @@ try {
     }
 
     if ($action === 'trainees') {
+        $user = authenticate($pdo);
         $workspaceId = trim((string)($_GET['workspaceId'] ?? ''));
         $trainingId = trim((string)($_GET['trainingId'] ?? ''));
+        
+        if ($user['role'] !== 'super_admin' && $user['workspace_id'] !== $workspaceId) {
+             fail('Access denied.', 403);
+        }
+        
         if ($workspaceId === '' || $trainingId === '') fail('workspaceId and trainingId are required.');
 
         $stmt = $pdo->prepare("SELECT * FROM trainees WHERE workspace_id = ? AND training_id = ? ORDER BY created_at ASC");
@@ -530,6 +678,7 @@ try {
     }
 
     if ($action === 'trainees_add') {
+        // Public endpoint
         $input = request_data();
         $workspaceId = (string)($input['workspaceId'] ?? '');
         $trainee = $input['trainee'] ?? null;
@@ -565,9 +714,18 @@ try {
     }
 
     if ($action === 'trainees_remove') {
+        $user = authenticate($pdo);
         $input = request_data();
         $workspaceId = (string)($input['workspaceId'] ?? '');
         $id = (string)($input['id'] ?? '');
+
+        if ($user['role'] !== 'super_admin' && $user['workspace_id'] !== $workspaceId) {
+             fail('Access denied.', 403);
+        }
+
+        // Optional: Check if user owns the training this trainee belongs to.
+        // For now, workspace check is enough for admins.
+
         if ($workspaceId === '' || $id === '') fail('Invalid payload.');
 
         $stmt = $pdo->prepare("DELETE FROM attendance WHERE workspace_id = ? AND trainee_id = ?");
@@ -578,8 +736,14 @@ try {
     }
 
     if ($action === 'attendance') {
+        $user = authenticate($pdo);
         $workspaceId = trim((string)($_GET['workspaceId'] ?? ''));
         $trainingId = trim((string)($_GET['trainingId'] ?? ''));
+        
+        if ($user['role'] !== 'super_admin' && $user['workspace_id'] !== $workspaceId) {
+             fail('Access denied.', 403);
+        }
+
         if ($workspaceId === '' || $trainingId === '') fail('workspaceId and trainingId are required.');
 
         $stmt = $pdo->prepare("SELECT * FROM attendance WHERE workspace_id = ? AND training_id = ? ORDER BY created_at ASC");
@@ -588,7 +752,13 @@ try {
     }
 
     if ($action === 'attendance_all') {
+        $user = authenticate($pdo);
         $workspaceId = trim((string)($_GET['workspaceId'] ?? ''));
+        
+        if ($user['role'] !== 'super_admin' && $user['workspace_id'] !== $workspaceId) {
+             fail('Access denied.', 403);
+        }
+
         if ($workspaceId === '') fail('workspaceId is required.');
 
         $stmt = $pdo->prepare("SELECT * FROM attendance WHERE workspace_id = ? ORDER BY created_at ASC");

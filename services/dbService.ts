@@ -35,12 +35,28 @@ const request = async <T>(
 ): Promise<T> => {
   const qs = toQueryString({ action, ...(query || {}) });
   const url = `${API_BASE}?${qs}`;
+
+  const storedUser = localStorage.getItem('traintrack_user');
+  let token = '';
+  if (storedUser) {
+    try {
+      token = JSON.parse(storedUser).apiToken || '';
+    } catch {}
+  }
+
+  const headers: Record<string, string> = {
+    Accept: 'application/json',
+  };
+  if (method === 'POST') {
+    headers['Content-Type'] = 'application/json';
+  }
+  if (token) {
+    headers['Authorization'] = `Bearer ${token}`;
+  }
+
   const response = await fetch(url, {
     method,
-    headers:
-      method === 'POST'
-        ? { 'Content-Type': 'application/json', Accept: 'application/json' }
-        : { Accept: 'application/json' },
+    headers,
     body: method === 'POST' ? JSON.stringify(payload || {}) : undefined,
   });
 
